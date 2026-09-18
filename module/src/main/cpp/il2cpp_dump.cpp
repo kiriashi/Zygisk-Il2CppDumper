@@ -34,6 +34,8 @@
 
 static uint64_t il2cpp_base = 0;
 static constexpr uint32_t kMaxMetadataVersion = 40;
+// Target-specific fallback hint from the encrypted metadata sample.
+static constexpr size_t kExpectedMetadataSize = 64060984;
 
 static void append_dump_log(const char *out_dir, const char *message) {
     if (out_dir == nullptr) return;
@@ -83,12 +85,21 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
     file_size = std::max(file_size, static_cast<size_t>(ehdr->e_phoff +
                                                          ehdr->e_phnum * sizeof(ElfW(Phdr))));
 
+    // Section headers are not mapped into a loaded shared object. Remove the
+    // stale offsets from the in-memory header so ELF tools do not read past
+    // the reconstructed file.
+    auto output_header = *ehdr;
+    output_header.e_shoff = 0;
+    output_header.e_shentsize = 0;
+    output_header.e_shnum = 0;
+    output_header.e_shstrndx = SHN_UNDEF;
+
     std::ofstream output(context->output, std::ios::binary | std::ios::trunc);
     if (!output.is_open()) return 1;
     output.seekp(static_cast<std::streamoff>(file_size - 1));
     output.put('\0');
     output.seekp(0);
-    output.write(reinterpret_cast<const char *>(base), sizeof(ElfW(Ehdr)));
+    output.write(reinterpret_cast<const char *>(&output_header), sizeof(output_header));
     output.seekp(static_cast<std::streamoff>(ehdr->e_phoff));
     output.write(reinterpret_cast<const char *>(info->dlpi_phdr),
                  static_cast<std::streamsize>(ehdr->e_phnum * sizeof(ElfW(Phdr))));
@@ -152,6 +163,7 @@ static bool dump_loaded_metadata(const char *out_dir) {
         uintptr_t start;
         uintptr_t end;
         bool named_metadata;
+        bool likely_metadata;
     };
     std::vector<MemoryRegion> regions;
     char line[1024];
@@ -169,23 +181,33 @@ static bool dump_loaded_metadata(const char *out_dir) {
             continue;
         }
         auto *metadata_path = strstr(line, "global-metadata.dat");
-        regions.push_back({start, end, metadata_path != nullptr});
+        const bool anonymous = strchr(line, '/') == nullptr;
+        const bool likely_metadata = anonymous && permissions[1] == 'w' &&
+                                     region_size >= kExpectedMetadataSize - 16 * 1024 * 1024ULL &&
+                                     region_size <= kExpectedMetadataSize + 16 * 1024 * 1024ULL;
+        regions.push_back({start, end, metadata_path != nullptr, likely_metadata});
     }
     fclose(maps);
     std::stable_sort(regions.begin(), regions.end(), [](const MemoryRegion &left,
                                                         const MemoryRegion &right) {
-        return left.named_metadata && !right.named_metadata;
+        if (left.named_metadata != right.named_metadata) return left.named_metadata;
+        return left.likely_metadata && !right.likely_metadata;
     });
     char region_message[128];
-    snprintf(region_message, sizeof(region_message), "global-metadata.dat: candidate mappings=%zu",
-             regions.size());
+    const auto likely_count = std::count_if(regions.begin(), regions.end(),
+                                             [](const MemoryRegion &region) {
+                                                 return region.likely_metadata;
+                                             });
+    snprintf(region_message, sizeof(region_message),
+             "global-metadata.dat: candidate mappings=%zu, size candidates=%zu", regions.size(),
+             likely_count);
     append_dump_log(out_dir, region_message);
 
     const auto named_mapping = std::find_if(regions.begin(), regions.end(),
                                              [](const MemoryRegion &region) {
                                                  return region.named_metadata;
                                              });
-    if (named_mapping == regions.end()) {
+    if (named_mapping == regions.end() && likely_count == 0) {
         append_dump_log(out_dir,
                         "global-metadata.dat: no named mapping; broad scan skipped");
         return false;
@@ -194,7 +216,7 @@ static bool dump_loaded_metadata(const char *out_dir) {
     bool dumped = false;
     size_t scanned = 0;
     for (const auto &region : regions) {
-        if (!region.named_metadata) continue;
+        if (!region.named_metadata && !region.likely_metadata) continue;
         const size_t region_size = region.end - region.start;
         if (scanned > 64 * 1024 * 1024ULL - region_size) break;
         scanned += region_size;
