@@ -90,7 +90,8 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
     // Current Unity metadata headers contain 35 offset/count pairs. Older
     // versions leave the remaining bytes unused, so scanning beyond this
     // range would mistake payload data for header fields.
-    for (size_t i = 8; i + 8 <= std::min(8 + 35 * 8, available); i += 8) {
+    constexpr size_t metadata_header_size = 8 + 35 * 8;
+    for (size_t i = 8; i + 8 <= std::min(metadata_header_size, available); i += 8) {
         uint32_t offset = *reinterpret_cast<const uint32_t *>(data + i);
         uint32_t count = *reinterpret_cast<const uint32_t *>(data + i + 4);
         if (offset > 256 * 1024 * 1024U || count > 256 * 1024 * 1024U ||
