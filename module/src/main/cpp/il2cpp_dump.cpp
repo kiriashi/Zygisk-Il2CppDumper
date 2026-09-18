@@ -181,11 +181,22 @@ static bool dump_loaded_metadata(const char *out_dir) {
              regions.size());
     append_dump_log(out_dir, region_message);
 
+    const auto named_mapping = std::find_if(regions.begin(), regions.end(),
+                                             [](const MemoryRegion &region) {
+                                                 return region.named_metadata;
+                                             });
+    if (named_mapping == regions.end()) {
+        append_dump_log(out_dir,
+                        "global-metadata.dat: no named mapping; broad scan skipped");
+        return false;
+    }
+
     bool dumped = false;
     size_t scanned = 0;
     for (const auto &region : regions) {
+        if (!region.named_metadata) continue;
         const size_t region_size = region.end - region.start;
-        if (scanned > 512 * 1024 * 1024ULL - region_size) break;
+        if (scanned > 64 * 1024 * 1024ULL - region_size) break;
         scanned += region_size;
         const uint8_t *memory = reinterpret_cast<const uint8_t *>(region.start);
         const size_t available = region_size;
