@@ -11,6 +11,13 @@
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <fcntl.h>
+#include <link.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
@@ -24,6 +31,106 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+static constexpr uint32_t kMaxMetadataVersion = 31;
+
+struct LibraryDumpContext {
+    const char *output;
+    bool found = false;
+};
+
+static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) {
+    auto *context = static_cast<LibraryDumpContext *>(opaque);
+    if (info->dlpi_name == nullptr || strstr(info->dlpi_name, "libil2cpp.so") == nullptr) {
+        return 0;
+    }
+
+    uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
+    size_t file_size = sizeof(ElfW(Ehdr));
+    for (size_t i = 0; i < info->dlpi_phnum; ++i) {
+        const auto &phdr = info->dlpi_phdr[i];
+        if (phdr.p_type == PT_LOAD) {
+            file_size = std::max(file_size, static_cast<size_t>(phdr.p_offset + phdr.p_filesz));
+        }
+    }
+
+    std::ofstream output(context->output, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) return 1;
+    output.seekp(static_cast<std::streamoff>(file_size - 1));
+    output.put('\0');
+    output.seekp(0);
+    output.write(reinterpret_cast<const char *>(base), sizeof(ElfW(Ehdr)));
+    auto *ehdr = reinterpret_cast<const ElfW(Ehdr) *>(base);
+    const auto *phdrs = reinterpret_cast<const ElfW(Phdr) *>(base + ehdr->e_phoff);
+    output.seekp(static_cast<std::streamoff>(ehdr->e_phoff));
+    output.write(reinterpret_cast<const char *>(phdrs),
+                 static_cast<std::streamsize>(ehdr->e_phnum * sizeof(ElfW(Phdr))));
+    for (size_t i = 0; i < info->dlpi_phnum; ++i) {
+        const auto &phdr = info->dlpi_phdr[i];
+        if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0) continue;
+        output.seekp(static_cast<std::streamoff>(phdr.p_offset));
+        output.write(reinterpret_cast<const char *>(base + phdr.p_vaddr),
+                     static_cast<std::streamsize>(phdr.p_filesz));
+    }
+    context->found = output.good();
+    return 1;
+}
+
+static bool dump_loaded_library(const char *out_dir) {
+    auto path = std::string(out_dir) + "/files/libil2cpp.so";
+    LibraryDumpContext context{path.c_str()};
+    xdl_iterate_phdr(dump_loaded_library, &context, XDL_FULL_PATHNAME);
+    return context.found;
+}
+
+static bool valid_metadata_header(const uint8_t *data, size_t available, size_t *size) {
+    if (available < 8 || *reinterpret_cast<const uint32_t *>(data) != 0xFAB11BAFU) return false;
+    auto version = *reinterpret_cast<const uint32_t *>(data + 4);
+    if (version < 16 || version >  kMaxMetadataVersion) return false;
+    size_t end = 8;
+    // Current Unity metadata headers contain 35 offset/count pairs. Older
+    // versions leave the remaining bytes unused, so scanning beyond this
+    // range would mistake payload data for header fields.
+    for (size_t i = 8; i + 8 <= std::min(8 + 35 * 8, available); i += 8) {
+        uint32_t offset = *reinterpret_cast<const uint32_t *>(data + i);
+        uint32_t count = *reinterpret_cast<const uint32_t *>(data + i + 4);
+        if (offset > 256 * 1024 * 1024U || count > 256 * 1024 * 1024U ||
+            static_cast<uint64_t>(offset) + count > 256 * 1024 * 1024ULL) return false;
+        end = std::max(end, static_cast<size_t>(offset) + count);
+    }
+    if (end < 1024 || end > 256 * 1024 * 1024U || end > available) return false;
+    *size = end;
+    return true;
+}
+
+static bool dump_loaded_metadata(const char *out_dir) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return false;
+    uintptr_t start, end;
+    char permissions[5];
+    char pathname[256];
+    bool dumped = false;
+    while (!dumped && fscanf(maps, "%" SCNxPTR "-%" SCNxPTR " %4s %*s %*s %*s %255[^\n]\n",
+                             &start, &end, permissions, pathname) >= 3) {
+        if (permissions[0] != 'r' || end <= start || end - start > 256 * 1024 * 1024ULL) continue;
+        const uint8_t *memory = reinterpret_cast<const uint8_t *>(start);
+        const size_t available = end - start;
+        for (size_t offset = 0; offset + 8 <= available; ++offset) {
+            size_t metadata_size = 0;
+            if (!valid_metadata_header(memory + offset, available - offset, &metadata_size)) continue;
+            auto path = std::string(out_dir) + "/files/global-metadata.dat";
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            if (output.is_open()) {
+                output.write(reinterpret_cast<const char *>(memory + offset),
+                             static_cast<std::streamsize>(metadata_size));
+                dumped = output.good();
+            }
+            if (dumped) LOGI("global-metadata.dat dumped: %zu bytes", metadata_size);
+            break;
+        }
+    }
+    fclose(maps);
+    return dumped;
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -345,11 +452,18 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    if (outDir == nullptr || il2cpp_domain_get == nullptr ||
+        il2cpp_domain_get_assemblies == nullptr || il2cpp_assembly_get_image == nullptr) {
+        LOGE("Required il2cpp APIs are unavailable");
+        return;
+    }
+    LOGI("libil2cpp.so dump: %s", dump_loaded_library(outDir) ? "ok" : "failed");
+    LOGI("global-metadata.dat dump: %s", dump_loaded_metadata(outDir) ? "ok" : "not found");
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
     std::stringstream imageOutput;
-    for (int i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
         imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
     }
@@ -357,13 +471,14 @@ void il2cpp_dump(const char *outDir) {
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
         //使用il2cpp_image_get_class
-        for (int i = 0; i < size; ++i) {
+        for (size_t i = 0; i < size; ++i) {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
             std::stringstream imageStr;
             imageStr << "\n// Dll : " << il2cpp_image_get_name(image);
             auto classCount = il2cpp_image_get_class_count(image);
-            for (int j = 0; j < classCount; ++j) {
+            for (size_t j = 0; j < classCount; ++j) {
                 auto klass = il2cpp_image_get_class(image, j);
+                if (klass == nullptr) continue;
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
                 //LOGD("type name : %s", il2cpp_type_get_name(type));
                 auto outPut = imageStr.str() + dump_type(type);
@@ -391,7 +506,7 @@ void il2cpp_dump(const char *outDir) {
         }
         typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
         typedef Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
-        for (int i = 0; i < size; ++i) {
+        for (size_t i = 0; i < size; ++i) {
             auto image = il2cpp_assembly_get_image(assemblies[i]);
             std::stringstream imageStr;
             auto image_name = il2cpp_image_get_name(image);
@@ -406,6 +521,7 @@ void il2cpp_dump(const char *outDir) {
                                                                                         nullptr);
             auto reflectionTypes = ((Assembly_GetTypes_ftn) assemblyGetTypes->methodPointer)(
                     reflectionAssembly, nullptr);
+            if (reflectionTypes == nullptr) continue;
             auto items = reflectionTypes->vector;
             for (int j = 0; j < reflectionTypes->max_length; ++j) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
@@ -419,6 +535,10 @@ void il2cpp_dump(const char *outDir) {
     LOGI("write dump file");
     auto outPath = std::string(outDir).append("/files/dump.cs");
     std::ofstream outStream(outPath);
+    if (!outStream.is_open()) {
+        LOGE("Unable to open dump file: %s", outPath.c_str());
+        return;
+    }
     outStream << imageOutput.str();
     auto count = outPuts.size();
     for (int i = 0; i < count; ++i) {

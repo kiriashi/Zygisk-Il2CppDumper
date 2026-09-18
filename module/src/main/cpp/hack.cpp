@@ -37,7 +37,18 @@ void hack_start(const char *game_data_dir) {
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
+    bool attached = false;
+    if (vms->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (vms->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("AttachCurrentThread failed");
+            return {};
+        }
+        attached = true;
+    }
+    auto finish = [&](std::string result) {
+        if (attached) vms->DetachCurrentThread();
+        return result;
+    };
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
@@ -64,7 +75,7 @@ std::string GetLibDir(JavaVM *vms) {
                         LOGI("lib dir %s", path);
                         std::string lib_dir(path);
                         env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
+                        return finish(lib_dir);
                     } else {
                         LOGE("nativeLibraryDir not found");
                     }
@@ -80,7 +91,7 @@ std::string GetLibDir(JavaVM *vms) {
     } else {
         LOGE("ActivityThread not found");
     }
-    return {};
+    return finish({});
 }
 
 static std::string GetNativeBridgeLibrary() {
@@ -115,10 +126,25 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     //TODO 等待houdini初始化
     sleep(5);
 
+    if (data == nullptr || length == 0) {
+        LOGE("Invalid arm library mapping");
+        return false;
+    }
+    bool mapping_owned = true;
+
     auto libart = dlopen("libart.so", RTLD_NOW);
+    if (libart == nullptr) {
+        munmap(data, length);
+        return false;
+    }
     auto JNI_GetCreatedJavaVMs = (jint (*)(JavaVM **, jsize, jsize *)) dlsym(libart,
                                                                              "JNI_GetCreatedJavaVMs");
     LOGI("JNI_GetCreatedJavaVMs %p", JNI_GetCreatedJavaVMs);
+    if (JNI_GetCreatedJavaVMs == nullptr) {
+        dlclose(libart);
+        munmap(data, length);
+        return false;
+    }
     JavaVM *vms_buf[1];
     JavaVM *vms;
     jsize num_vms;
@@ -127,17 +153,22 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
         vms = vms_buf[0];
     } else {
         LOGE("GetCreatedJavaVMs error");
+        dlclose(libart);
+        munmap(data, length);
         return false;
     }
 
     auto lib_dir = GetLibDir(vms);
     if (lib_dir.empty()) {
         LOGE("GetLibDir error");
+        dlclose(libart);
+        munmap(data, length);
         return false;
     }
     if (lib_dir.find("/lib/x86") != std::string::npos) {
         LOGI("no need NativeBridge");
         munmap(data, length);
+        dlclose(libart);
         return false;
     }
 
@@ -156,33 +187,53 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
             LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
 
             int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
+            if (fd < 0 || ftruncate(fd, (off_t) length) != 0) {
+                if (fd >= 0) close(fd);
+                munmap(data, length);
+                dlclose(libart);
+                return false;
+            }
             void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
+            if (mem == MAP_FAILED) {
+                close(fd);
+                munmap(data, length);
+                dlclose(libart);
+                return false;
+            }
             memcpy(mem, data, length);
             munmap(mem, length);
             munmap(data, length);
+            mapping_owned = false;
             char path[PATH_MAX];
             snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
             LOGI("arm path %s", path);
 
             void *arm_handle;
-            if (api_level >= 26) {
+            if (api_level >= 26 && callbacks->loadLibraryExt != nullptr) {
                 arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-            } else {
+            } else if (callbacks->loadLibrary != nullptr) {
                 arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
+            } else {
+                arm_handle = nullptr;
             }
             if (arm_handle) {
                 LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
+                auto init = callbacks->getTrampoline == nullptr ? nullptr :
+                            (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
                                                                                   "JNI_OnLoad",
                                                                                   nullptr, 0);
                 LOGI("JNI_OnLoad %p", init);
-                init(vms, (void *) game_data_dir);
-                return true;
+                if (init != nullptr) {
+                    init(vms, (void *) game_data_dir);
+                    dlclose(libart);
+                    return true;
+                }
             }
             close(fd);
         }
     }
+    if (mapping_owned) munmap(data, length);
+    dlclose(libart);
     return false;
 }
 
