@@ -135,8 +135,8 @@ static bool dump_loaded_metadata(const char *out_dir) {
         char *special_mapping = strchr(line, '[');
         const size_t region_size = end - start;
         if (special_mapping != nullptr || permissions[0] != 'r' || permissions[2] == 'x' ||
-            end <= start || region_size > 128 * 1024 * 1024ULL ||
-            scanned > 512 * 1024 * 1024ULL - region_size) {
+            end <= start || region_size > 64 * 1024 * 1024ULL ||
+            scanned > 64 * 1024 * 1024ULL - region_size) {
             continue;
         }
         scanned += region_size;
