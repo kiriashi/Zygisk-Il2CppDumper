@@ -31,7 +31,13 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
-static constexpr uint32_t kMaxMetadataVersion = 31;
+static constexpr uint32_t kMaxMetadataVersion = 40;
+
+static void append_dump_log(const char *out_dir, const char *message) {
+    if (out_dir == nullptr) return;
+    std::ofstream log(std::string(out_dir) + "/files/dump.log", std::ios::app);
+    if (log.is_open()) log << message << '\n';
+}
 
 struct LibraryDumpContext {
     const char *output;
@@ -79,6 +85,8 @@ static bool dump_loaded_library(const char *out_dir) {
     auto path = std::string(out_dir) + "/files/libil2cpp.so";
     LibraryDumpContext context{path.c_str()};
     xdl_iterate_phdr(dump_loaded_library, &context, XDL_FULL_PATHNAME);
+    append_dump_log(out_dir, context.found ? "libil2cpp.so: written" :
+                                            "libil2cpp.so: not found or write failed");
     return context.found;
 }
 
@@ -91,10 +99,8 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
     if (magic != 0xFAB11BAFU) return false;
     if (version < 16 || version >  kMaxMetadataVersion) return false;
     size_t end = 8;
-    // Current Unity metadata headers contain 35 offset/count pairs. Older
-    // versions leave the remaining bytes unused, so scanning beyond this
-    // range would mistake payload data for header fields.
-    constexpr size_t metadata_header_size = 8 + 35 * 8;
+    // Keep the scan bounded for older and newer Unity metadata layouts.
+    constexpr size_t metadata_header_size = 8 + 40 * 8;
     for (size_t i = 8; i + 8 <= std::min(metadata_header_size, available); i += 8) {
         uint32_t offset;
         uint32_t count;
@@ -111,7 +117,10 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
 
 static bool dump_loaded_metadata(const char *out_dir) {
     FILE *maps = fopen("/proc/self/maps", "r");
-    if (maps == nullptr) return false;
+    if (maps == nullptr) {
+        append_dump_log(out_dir, "global-metadata.dat: unable to open /proc/self/maps");
+        return false;
+    }
     uintptr_t start, end;
     char permissions[5];
     char line[1024];
@@ -120,13 +129,10 @@ static bool dump_loaded_metadata(const char *out_dir) {
         if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
             continue;
         }
-        // Metadata is normally held in an anonymous writable allocation.
-        // Avoid scanning file-backed mappings and stacks, which are both
-        // expensive and more likely to contain unrelated magic values.
-        char *pathname = strchr(line, '/');
+        // Avoid executable mappings and special kernel-provided mappings.
         char *special_mapping = strchr(line, '[');
-        if (pathname != nullptr || special_mapping != nullptr || permissions[0] != 'r' ||
-            permissions[1] != 'w' || end <= start || end - start > 256 * 1024 * 1024ULL) {
+        if (special_mapping != nullptr || permissions[0] != 'r' || permissions[2] == 'x' ||
+            end <= start || end - start > 256 * 1024 * 1024ULL) {
             continue;
         }
         const uint8_t *memory = reinterpret_cast<const uint8_t *>(start);
@@ -141,11 +147,18 @@ static bool dump_loaded_metadata(const char *out_dir) {
                              static_cast<std::streamsize>(metadata_size));
                 dumped = output.good();
             }
-            if (dumped) LOGI("global-metadata.dat dumped: %zu bytes", metadata_size);
+            if (dumped) {
+                LOGI("global-metadata.dat dumped: %zu bytes", metadata_size);
+                char message[128];
+                snprintf(message, sizeof(message), "global-metadata.dat: written (%zu bytes)",
+                         metadata_size);
+                append_dump_log(out_dir, message);
+            }
             break;
         }
     }
     fclose(maps);
+    if (!dumped) append_dump_log(out_dir, "global-metadata.dat: valid header not found");
     return dumped;
 }
 
@@ -469,14 +482,19 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    append_dump_log(outDir, "dump started");
     if (outDir == nullptr || il2cpp_domain_get == nullptr ||
         il2cpp_domain_get_assemblies == nullptr || il2cpp_assembly_get_image == nullptr) {
         LOGE("Required il2cpp APIs are unavailable");
+        append_dump_log(outDir, "error: required il2cpp APIs are unavailable");
         return;
     }
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+    char assembly_message[128];
+    snprintf(assembly_message, sizeof(assembly_message), "assemblies: %zu", size);
+    append_dump_log(outDir, assembly_message);
     std::stringstream imageOutput;
     for (size_t i = 0; i < size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
@@ -552,6 +570,7 @@ void il2cpp_dump(const char *outDir) {
     std::ofstream outStream(outPath);
     if (!outStream.is_open()) {
         LOGE("Unable to open dump file: %s", outPath.c_str());
+        append_dump_log(outDir, "error: unable to open dump.cs");
         return;
     }
     outStream << imageOutput.str();
@@ -561,6 +580,7 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+    append_dump_log(outDir, "dump.cs: written");
     LOGI("libil2cpp.so dump: %s", dump_loaded_library(outDir) ? "ok" : "failed");
     LOGI("global-metadata.dat dump: %s", dump_loaded_metadata(outDir) ? "ok" : "not found");
 }
