@@ -1,6 +1,5 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
 
-import java.nio.file.Paths
 import java.nio.file.Files
 
 apply plugin: 'com.android.library'
@@ -68,12 +67,17 @@ androidComponents {
                 into 'lib'
             }
             doLast {
-                file("$magiskDir/zygisk").mkdir()
-                fileTree("$magiskDir/lib").visit { f ->
-                    if (!f.directory) return
-                    def srcPath = Paths.get("${f.file.absolutePath}/lib${moduleLibraryName}.so")
-                    def dstPath = Paths.get("$magiskDir/zygisk/${f.path}.so")
-                    Files.move(srcPath, dstPath)
+                def zygiskDir = file("$magiskDir/zygisk")
+                zygiskDir.mkdirs()
+                def nativeLibraries = fileTree("$magiskDir/lib").matching {
+                    include "**/lib${moduleLibraryName}.so"
+                }.files
+                if (nativeLibraries.isEmpty()) {
+                    throw new GradleException("Native library lib${moduleLibraryName}.so was not packaged")
+                }
+                nativeLibraries.each { library ->
+                    def abi = library.parentFile.name
+                    Files.move(library.toPath(), file("$zygiskDir/${abi}.so").toPath())
                 }
                 new File("$magiskDir/lib").deleteDir()
             }
