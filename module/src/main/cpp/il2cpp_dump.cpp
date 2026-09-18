@@ -16,9 +16,11 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <link.h>
+#include <elf.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <cerrno>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -39,6 +41,14 @@ static void append_dump_log(const char *out_dir, const char *message) {
     if (log.is_open()) log << message << '\n';
 }
 
+static bool commit_dump_file(const std::string &temporary, const std::string &final) {
+    if (rename(temporary.c_str(), final.c_str()) != 0) {
+        unlink(temporary.c_str());
+        return false;
+    }
+    return true;
+}
+
 struct LibraryDumpContext {
     const char *output;
     bool found = false;
@@ -51,13 +61,27 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
     }
 
     uintptr_t base = static_cast<uintptr_t>(info->dlpi_addr);
+    if (base == 0 || memcmp(reinterpret_cast<const void *>(base), ELFMAG, SELFMAG) != 0) {
+        return 0;
+    }
+    auto *ehdr = reinterpret_cast<const ElfW(Ehdr) *>(base);
+    if ((sizeof(void *) == 8 && ehdr->e_ident[EI_CLASS] != ELFCLASS64) ||
+        (sizeof(void *) == 4 && ehdr->e_ident[EI_CLASS] != ELFCLASS32) ||
+        ehdr->e_phentsize != sizeof(ElfW(Phdr)) || ehdr->e_phnum == 0 ||
+        ehdr->e_phnum > info->dlpi_phnum) {
+        return 0;
+    }
     size_t file_size = sizeof(ElfW(Ehdr));
     for (size_t i = 0; i < info->dlpi_phnum; ++i) {
         const auto &phdr = info->dlpi_phdr[i];
         if (phdr.p_type == PT_LOAD) {
+            if (phdr.p_filesz > SIZE_MAX - phdr.p_offset) return 0;
             file_size = std::max(file_size, static_cast<size_t>(phdr.p_offset + phdr.p_filesz));
         }
     }
+    if (ehdr->e_phoff > SIZE_MAX - ehdr->e_phnum * sizeof(ElfW(Phdr))) return 0;
+    file_size = std::max(file_size, static_cast<size_t>(ehdr->e_phoff +
+                                                         ehdr->e_phnum * sizeof(ElfW(Phdr))));
 
     std::ofstream output(context->output, std::ios::binary | std::ios::trunc);
     if (!output.is_open()) return 1;
@@ -65,15 +89,14 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
     output.put('\0');
     output.seekp(0);
     output.write(reinterpret_cast<const char *>(base), sizeof(ElfW(Ehdr)));
-    auto *ehdr = reinterpret_cast<const ElfW(Ehdr) *>(base);
-    const auto *phdrs = reinterpret_cast<const ElfW(Phdr) *>(base + ehdr->e_phoff);
     output.seekp(static_cast<std::streamoff>(ehdr->e_phoff));
-    output.write(reinterpret_cast<const char *>(phdrs),
+    output.write(reinterpret_cast<const char *>(info->dlpi_phdr),
                  static_cast<std::streamsize>(ehdr->e_phnum * sizeof(ElfW(Phdr))));
     for (size_t i = 0; i < info->dlpi_phnum; ++i) {
         const auto &phdr = info->dlpi_phdr[i];
         if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0) continue;
         output.seekp(static_cast<std::streamoff>(phdr.p_offset));
+        if (phdr.p_vaddr > UINTPTR_MAX - base) return 0;
         output.write(reinterpret_cast<const char *>(base + phdr.p_vaddr),
                      static_cast<std::streamsize>(phdr.p_filesz));
     }
@@ -83,8 +106,11 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
 
 static bool dump_loaded_library(const char *out_dir) {
     auto path = std::string(out_dir) + "/files/libil2cpp.so";
-    LibraryDumpContext context{path.c_str()};
+    auto temporary = path + ".tmp";
+    LibraryDumpContext context{temporary.c_str()};
     xdl_iterate_phdr(dump_loaded_library, &context, XDL_FULL_PATHNAME);
+    if (context.found) context.found = commit_dump_file(temporary, path);
+    else unlink(temporary.c_str());
     append_dump_log(out_dir, context.found ? "libil2cpp.so: written" :
                                             "libil2cpp.so: not found or write failed");
     return context.found;
@@ -122,36 +148,70 @@ static bool dump_loaded_metadata(const char *out_dir) {
         append_dump_log(out_dir, "global-metadata.dat: unable to open /proc/self/maps");
         return false;
     }
-    uintptr_t start, end;
-    char permissions[5];
+    struct MemoryRegion {
+        uintptr_t start;
+        uintptr_t end;
+        bool named_metadata;
+    };
+    std::vector<MemoryRegion> regions;
     char line[1024];
-    bool dumped = false;
-    size_t scanned = 0;
-    while (!dumped && fgets(line, sizeof(line), maps) != nullptr) {
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        uintptr_t start, end;
+        char permissions[5];
         if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
             continue;
         }
         // Avoid executable mappings and special kernel-provided mappings.
         char *special_mapping = strchr(line, '[');
-        const size_t region_size = end - start;
+        const size_t region_size = end > start ? end - start : 0;
         if (special_mapping != nullptr || permissions[0] != 'r' || permissions[2] == 'x' ||
-            end <= start || region_size > 64 * 1024 * 1024ULL ||
-            scanned > 64 * 1024 * 1024ULL - region_size) {
+            region_size == 0 || region_size > 64 * 1024 * 1024ULL) {
             continue;
         }
+        auto *metadata_path = strstr(line, "global-metadata.dat");
+        regions.push_back({start, end, metadata_path != nullptr});
+    }
+    fclose(maps);
+    std::stable_sort(regions.begin(), regions.end(), [](const MemoryRegion &left,
+                                                        const MemoryRegion &right) {
+        return left.named_metadata && !right.named_metadata;
+    });
+    char region_message[128];
+    snprintf(region_message, sizeof(region_message), "global-metadata.dat: candidate mappings=%zu",
+             regions.size());
+    append_dump_log(out_dir, region_message);
+
+    bool dumped = false;
+    size_t scanned = 0;
+    for (const auto &region : regions) {
+        const size_t region_size = region.end - region.start;
+        if (scanned > 512 * 1024 * 1024ULL - region_size) break;
         scanned += region_size;
-        const uint8_t *memory = reinterpret_cast<const uint8_t *>(start);
+        const uint8_t *memory = reinterpret_cast<const uint8_t *>(region.start);
         const size_t available = region_size;
-        for (size_t offset = 0; offset + 8 <= available; offset += 4) {
+        constexpr uint8_t metadata_magic[] = {0xAF, 0x1B, 0xB1, 0xFA};
+        size_t offset = 0;
+        while (offset + sizeof(metadata_magic) <= available) {
+            auto *match = static_cast<const uint8_t *>(
+                    memmem(memory + offset, available - offset, metadata_magic,
+                           sizeof(metadata_magic)));
+            if (match == nullptr) break;
+            offset = static_cast<size_t>(match - memory);
             size_t metadata_size = 0;
-            if (!valid_metadata_header(memory + offset, available - offset, &metadata_size)) continue;
+            if (!valid_metadata_header(memory + offset, available - offset, &metadata_size)) {
+                offset += sizeof(metadata_magic);
+                continue;
+            }
             auto path = std::string(out_dir) + "/files/global-metadata.dat";
-            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            auto temporary = path + ".tmp";
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
             if (output.is_open()) {
                 output.write(reinterpret_cast<const char *>(memory + offset),
                              static_cast<std::streamsize>(metadata_size));
-                dumped = output.good();
+                output.close();
+                dumped = output.good() && commit_dump_file(temporary, path);
             }
+            if (!dumped) unlink(temporary.c_str());
             if (dumped) {
                 LOGI("global-metadata.dat dumped: %zu bytes", metadata_size);
                 char message[128];
@@ -161,8 +221,8 @@ static bool dump_loaded_metadata(const char *out_dir) {
             }
             break;
         }
+        if (dumped) break;
     }
-    fclose(maps);
     if (!dumped) append_dump_log(out_dir, "global-metadata.dat: valid header not found");
     return dumped;
 }
@@ -464,10 +524,11 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
-void il2cpp_api_init(void *handle) {
+bool il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
+    if (handle == nullptr) return false;
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies) {
+    if (il2cpp_domain_get && il2cpp_domain_get_assemblies && il2cpp_thread_attach) {
         Dl_info dlInfo;
         if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
             il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
@@ -475,14 +536,20 @@ void il2cpp_api_init(void *handle) {
         LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
     } else {
         LOGE("Failed to initialize il2cpp api.");
-        return;
+        return false;
     }
-    while (!il2cpp_is_vm_thread(nullptr)) {
+    if (il2cpp_is_vm_thread) {
+        while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
         sleep(1);
+        }
     }
     auto domain = il2cpp_domain_get();
-    il2cpp_thread_attach(domain);
+    if (domain == nullptr || il2cpp_thread_attach(domain) == nullptr) {
+        LOGE("Failed to attach to il2cpp domain");
+        return false;
+    }
+    return true;
 }
 
 void il2cpp_dump(const char *outDir) {
@@ -492,6 +559,12 @@ void il2cpp_dump(const char *outDir) {
         il2cpp_domain_get_assemblies == nullptr || il2cpp_assembly_get_image == nullptr) {
         LOGE("Required il2cpp APIs are unavailable");
         append_dump_log(outDir, "error: required il2cpp APIs are unavailable");
+        return;
+    }
+    if (il2cpp_class_get_type == nullptr || il2cpp_class_from_type == nullptr ||
+        il2cpp_class_get_name == nullptr || il2cpp_class_get_namespace == nullptr) {
+        LOGE("Required class APIs are unavailable");
+        append_dump_log(outDir, "error: required class APIs are unavailable");
         return;
     }
     size_t size;
@@ -572,7 +645,8 @@ void il2cpp_dump(const char *outDir) {
     }
     LOGI("write dump file");
     auto outPath = std::string(outDir).append("/files/dump.cs");
-    std::ofstream outStream(outPath);
+    auto temporaryPath = outPath + ".tmp";
+    std::ofstream outStream(temporaryPath);
     if (!outStream.is_open()) {
         LOGE("Unable to open dump file: %s", outPath.c_str());
         append_dump_log(outDir, "error: unable to open dump.cs");
@@ -584,6 +658,11 @@ void il2cpp_dump(const char *outDir) {
         outStream << outPuts[i];
     }
     outStream.close();
+    if (!outStream.good() || !commit_dump_file(temporaryPath, outPath)) {
+        append_dump_log(outDir, "error: failed to commit dump.cs");
+        unlink(temporaryPath.c_str());
+        return;
+    }
     LOGI("dump done!");
     append_dump_log(outDir, "dump.cs: written");
     LOGI("libil2cpp.so dump: %s", dump_loaded_library(outDir) ? "ok" : "failed");
