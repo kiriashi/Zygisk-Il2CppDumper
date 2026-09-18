@@ -16,8 +16,15 @@
 #include <sys/mman.h>
 #include <linux/unistd.h>
 #include <array>
+#include <atomic>
+
+static std::atomic_flag dump_started = ATOMIC_FLAG_INIT;
 
 void hack_start(const char *game_data_dir) {
+    if (dump_started.test_and_set(std::memory_order_acq_rel)) {
+        LOGI("dump already started, skipping duplicate thread");
+        return;
+    }
     bool load = false;
     for (int i = 0; i < 10; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);

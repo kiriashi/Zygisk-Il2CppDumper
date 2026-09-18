@@ -129,17 +129,19 @@ static bool dump_loaded_library(const char *out_dir) {
     return context.found;
 }
 
-static bool valid_metadata_header(const uint8_t *data, size_t available, size_t *size) {
+static bool valid_metadata_header(const uint8_t *data, size_t available, size_t *size,
+                                  bool require_magic = true) {
     if (available < 8) return false;
     uint32_t magic;
     uint32_t version;
     memcpy(&magic, data, sizeof(magic));
     memcpy(&version, data + 4, sizeof(version));
-    if (magic != 0xFAB11BAFU) return false;
+    if (require_magic && magic != 0xFAB11BAFU) return false;
     if (version < 16 || version >  kMaxMetadataVersion) return false;
     size_t end = 8;
     // Keep the scan bounded for older and newer Unity metadata layouts.
-    constexpr size_t metadata_header_size = 8 + 40 * 8;
+    const size_t pair_count = version <= 24 ? 35 : 40;
+    const size_t metadata_header_size = 8 + pair_count * 8;
     for (size_t i = 8; i + 8 <= std::min(metadata_header_size, available); i += 8) {
         uint32_t offset;
         uint32_t count;
@@ -155,7 +157,7 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
 }
 
 static bool dump_metadata_blob(const char *out_dir, const uint8_t *data, size_t available,
-                               const char *source) {
+                               const char *source, bool trusted_pointer = false) {
     uint32_t magic = 0;
     uint32_t version = 0;
     if (available >= 8) {
@@ -169,7 +171,7 @@ static bool dump_metadata_blob(const char *out_dir, const uint8_t *data, size_t 
              source, available, magic, version);
     append_dump_log(out_dir, header_message);
     size_t metadata_size = 0;
-    if (!valid_metadata_header(data, available, &metadata_size)) return false;
+    if (!valid_metadata_header(data, available, &metadata_size, !trusted_pointer)) return false;
     auto path = std::string(out_dir) + "/files/global-metadata.dat";
     auto temporary = path + ".tmp";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -221,7 +223,7 @@ static bool dump_metadata_from_runtime_global(const char *out_dir) {
             }
             dumped = dump_metadata_blob(out_dir,
                                         reinterpret_cast<const uint8_t *>(metadata_address),
-                                        end - metadata_address, "runtime-global");
+                                        end - metadata_address, "runtime-global", true);
             break;
         }
         break;
