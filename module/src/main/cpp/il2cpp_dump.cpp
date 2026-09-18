@@ -156,6 +156,18 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
 
 static bool dump_metadata_blob(const char *out_dir, const uint8_t *data, size_t available,
                                const char *source) {
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (available >= 8) {
+        memcpy(&magic, data, sizeof(magic));
+        memcpy(&version, data + 4, sizeof(version));
+    }
+    char header_message[192];
+    snprintf(header_message, sizeof(header_message),
+             "global-metadata.dat: source=%s available=%zu magic=0x%08" PRIx32
+             " version=%" PRIu32,
+             source, available, magic, version);
+    append_dump_log(out_dir, header_message);
     size_t metadata_size = 0;
     if (!valid_metadata_header(data, available, &metadata_size)) return false;
     auto path = std::string(out_dir) + "/files/global-metadata.dat";
