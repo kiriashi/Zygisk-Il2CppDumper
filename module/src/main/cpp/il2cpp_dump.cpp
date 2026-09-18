@@ -116,6 +116,7 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
 }
 
 static bool dump_loaded_metadata(const char *out_dir) {
+    append_dump_log(out_dir, "global-metadata.dat: scan started");
     FILE *maps = fopen("/proc/self/maps", "r");
     if (maps == nullptr) {
         append_dump_log(out_dir, "global-metadata.dat: unable to open /proc/self/maps");
@@ -125,19 +126,23 @@ static bool dump_loaded_metadata(const char *out_dir) {
     char permissions[5];
     char line[1024];
     bool dumped = false;
+    size_t scanned = 0;
     while (!dumped && fgets(line, sizeof(line), maps) != nullptr) {
         if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
             continue;
         }
         // Avoid executable mappings and special kernel-provided mappings.
         char *special_mapping = strchr(line, '[');
+        const size_t region_size = end - start;
         if (special_mapping != nullptr || permissions[0] != 'r' || permissions[2] == 'x' ||
-            end <= start || end - start > 256 * 1024 * 1024ULL) {
+            end <= start || region_size > 128 * 1024 * 1024ULL ||
+            scanned > 512 * 1024 * 1024ULL - region_size) {
             continue;
         }
+        scanned += region_size;
         const uint8_t *memory = reinterpret_cast<const uint8_t *>(start);
-        const size_t available = end - start;
-        for (size_t offset = 0; offset + 8 <= available; ++offset) {
+        const size_t available = region_size;
+        for (size_t offset = 0; offset + 8 <= available; offset += 4) {
             size_t metadata_size = 0;
             if (!valid_metadata_header(memory + offset, available - offset, &metadata_size)) continue;
             auto path = std::string(out_dir) + "/files/global-metadata.dat";
