@@ -1,6 +1,7 @@
 import org.apache.tools.ant.filters.FixCrLfFilter
 
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 apply plugin: 'com.android.library'
 apply from: file(rootProject.file('module.gradle'))
@@ -63,23 +64,22 @@ androidComponents {
                 filter(FixCrLfFilter.class,
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
-            from("$buildDir/intermediates/merged_native_libs/$variantLowered/out/lib") {
-                into 'lib'
-            }
             doLast {
                 def zygiskDir = file("$magiskDir/zygisk")
                 zygiskDir.mkdirs()
-                def nativeLibraries = fileTree("$magiskDir/lib").matching {
+                def nativeLibraries = fileTree("$buildDir/intermediates").matching {
                     include "**/lib${moduleLibraryName}.so"
-                }.files
+                }.files.findAll { library ->
+                    ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"].contains(library.parentFile.name)
+                }
                 if (nativeLibraries.isEmpty()) {
                     throw new GradleException("Native library lib${moduleLibraryName}.so was not packaged")
                 }
-                nativeLibraries.each { library ->
-                    def abi = library.parentFile.name
-                    Files.move(library.toPath(), file("$zygiskDir/${abi}.so").toPath())
+                nativeLibraries.groupBy { it.parentFile.name }.each { abi, libraries ->
+                    def library = libraries.find { it.path.contains("stripped_native_libs") } ?: libraries[0]
+                    Files.copy(library.toPath(), file("$zygiskDir/${abi}.so").toPath(),
+                            StandardCopyOption.REPLACE_EXISTING)
                 }
-                new File("$magiskDir/lib").deleteDir()
             }
         }
 
