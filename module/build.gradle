@@ -63,7 +63,7 @@ androidComponents {
                 filter(FixCrLfFilter.class,
                         eol: FixCrLfFilter.CrLf.newInstance("lf"))
             }
-            from("$buildDir/intermediates/stripped_native_libs/$variantLowered/out/lib") {
+            from("$buildDir/intermediates/merged_native_libs/$variantLowered/out/lib") {
                 into 'lib'
             }
             doLast {
