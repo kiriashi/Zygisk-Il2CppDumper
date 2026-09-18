@@ -83,8 +83,12 @@ static bool dump_loaded_library(const char *out_dir) {
 }
 
 static bool valid_metadata_header(const uint8_t *data, size_t available, size_t *size) {
-    if (available < 8 || *reinterpret_cast<const uint32_t *>(data) != 0xFAB11BAFU) return false;
-    auto version = *reinterpret_cast<const uint32_t *>(data + 4);
+    if (available < 8) return false;
+    uint32_t magic;
+    uint32_t version;
+    memcpy(&magic, data, sizeof(magic));
+    memcpy(&version, data + 4, sizeof(version));
+    if (magic != 0xFAB11BAFU) return false;
     if (version < 16 || version >  kMaxMetadataVersion) return false;
     size_t end = 8;
     // Current Unity metadata headers contain 35 offset/count pairs. Older
@@ -92,8 +96,10 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
     // range would mistake payload data for header fields.
     constexpr size_t metadata_header_size = 8 + 35 * 8;
     for (size_t i = 8; i + 8 <= std::min(metadata_header_size, available); i += 8) {
-        uint32_t offset = *reinterpret_cast<const uint32_t *>(data + i);
-        uint32_t count = *reinterpret_cast<const uint32_t *>(data + i + 4);
+        uint32_t offset;
+        uint32_t count;
+        memcpy(&offset, data + i, sizeof(offset));
+        memcpy(&count, data + i + 4, sizeof(count));
         if (offset > 256 * 1024 * 1024U || count > 256 * 1024 * 1024U ||
             static_cast<uint64_t>(offset) + count > 256 * 1024 * 1024ULL) return false;
         end = std::max(end, static_cast<size_t>(offset) + count);
@@ -108,11 +114,21 @@ static bool dump_loaded_metadata(const char *out_dir) {
     if (maps == nullptr) return false;
     uintptr_t start, end;
     char permissions[5];
-    char pathname[256];
+    char line[1024];
     bool dumped = false;
-    while (!dumped && fscanf(maps, "%" SCNxPTR "-%" SCNxPTR " %4s %*s %*s %*s %255[^\n]\n",
-                             &start, &end, permissions, pathname) >= 3) {
-        if (permissions[0] != 'r' || end <= start || end - start > 256 * 1024 * 1024ULL) continue;
+    while (!dumped && fgets(line, sizeof(line), maps) != nullptr) {
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
+            continue;
+        }
+        // Metadata is normally held in an anonymous writable allocation.
+        // Avoid scanning file-backed mappings and stacks, which are both
+        // expensive and more likely to contain unrelated magic values.
+        char *pathname = strchr(line, '/');
+        char *special_mapping = strchr(line, '[');
+        if (pathname != nullptr || special_mapping != nullptr || permissions[0] != 'r' ||
+            permissions[1] != 'w' || end <= start || end - start > 256 * 1024 * 1024ULL) {
+            continue;
+        }
         const uint8_t *memory = reinterpret_cast<const uint8_t *>(start);
         const size_t available = end - start;
         for (size_t offset = 0; offset + 8 <= available; ++offset) {
@@ -458,8 +474,6 @@ void il2cpp_dump(const char *outDir) {
         LOGE("Required il2cpp APIs are unavailable");
         return;
     }
-    LOGI("libil2cpp.so dump: %s", dump_loaded_library(outDir) ? "ok" : "failed");
-    LOGI("global-metadata.dat dump: %s", dump_loaded_metadata(outDir) ? "ok" : "not found");
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
@@ -547,4 +561,6 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+    LOGI("libil2cpp.so dump: %s", dump_loaded_library(outDir) ? "ok" : "failed");
+    LOGI("global-metadata.dat dump: %s", dump_loaded_metadata(outDir) ? "ok" : "not found");
 }
