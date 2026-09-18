@@ -36,6 +36,8 @@ static uint64_t il2cpp_base = 0;
 static constexpr uint32_t kMaxMetadataVersion = 40;
 // Target-specific fallback hint from the encrypted metadata sample.
 static constexpr size_t kExpectedMetadataSize = 64060984;
+// RVA recovered from the target's MetadataCache initialization path.
+static constexpr uintptr_t kMetadataGlobalRva = 0xCC5B120;
 
 static void append_dump_log(const char *out_dir, const char *message) {
     if (out_dir == nullptr) return;
@@ -152,8 +154,74 @@ static bool valid_metadata_header(const uint8_t *data, size_t available, size_t 
     return true;
 }
 
+static bool dump_metadata_blob(const char *out_dir, const uint8_t *data, size_t available,
+                               const char *source) {
+    size_t metadata_size = 0;
+    if (!valid_metadata_header(data, available, &metadata_size)) return false;
+    auto path = std::string(out_dir) + "/files/global-metadata.dat";
+    auto temporary = path + ".tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) return false;
+    output.write(reinterpret_cast<const char *>(data), static_cast<std::streamsize>(metadata_size));
+    output.close();
+    if (!output.good() || !commit_dump_file(temporary, path)) {
+        unlink(temporary.c_str());
+        return false;
+    }
+    char message[160];
+    snprintf(message, sizeof(message), "global-metadata.dat: written (%zu bytes, source=%s)",
+             metadata_size, source);
+    append_dump_log(out_dir, message);
+    LOGI("global-metadata.dat dumped: %zu bytes (%s)", metadata_size, source);
+    return true;
+}
+
+static bool dump_metadata_from_runtime_global(const char *out_dir) {
+    if (il2cpp_base == 0 || il2cpp_base > UINTPTR_MAX - kMetadataGlobalRva) return false;
+    const auto global_address = static_cast<uintptr_t>(il2cpp_base + kMetadataGlobalRva);
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps == nullptr) return false;
+    uintptr_t start, end;
+    char permissions[5];
+    char line[1024];
+    bool dumped = false;
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
+            continue;
+        }
+        if (permissions[0] != 'r' || global_address < start || global_address >= end) continue;
+        uintptr_t metadata_address = 0;
+        memcpy(&metadata_address, reinterpret_cast<const void *>(global_address),
+               sizeof(metadata_address));
+        char address_message[160];
+        snprintf(address_message, sizeof(address_message),
+                 "global-metadata.dat: global=0x%" PRIxPTR ", data=0x%" PRIxPTR,
+                 global_address, metadata_address);
+        append_dump_log(out_dir, address_message);
+        if (metadata_address == 0) break;
+        rewind(maps);
+        while (fgets(line, sizeof(line), maps) != nullptr) {
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &start, &end, permissions) != 3) {
+                continue;
+            }
+            if (permissions[0] != 'r' || metadata_address < start || metadata_address >= end) {
+                continue;
+            }
+            dumped = dump_metadata_blob(out_dir,
+                                        reinterpret_cast<const uint8_t *>(metadata_address),
+                                        end - metadata_address, "runtime-global");
+            break;
+        }
+        break;
+    }
+    fclose(maps);
+    if (!dumped) append_dump_log(out_dir, "global-metadata.dat: runtime global invalid");
+    return dumped;
+}
+
 static bool dump_loaded_metadata(const char *out_dir) {
     append_dump_log(out_dir, "global-metadata.dat: scan started");
+    if (dump_metadata_from_runtime_global(out_dir)) return true;
     FILE *maps = fopen("/proc/self/maps", "r");
     if (maps == nullptr) {
         append_dump_log(out_dir, "global-metadata.dat: unable to open /proc/self/maps");
