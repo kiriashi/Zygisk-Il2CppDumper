@@ -100,11 +100,6 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
     if (!output.is_open()) return 1;
     output.seekp(static_cast<std::streamoff>(file_size - 1));
     output.put('\0');
-    output.seekp(0);
-    output.write(reinterpret_cast<const char *>(&output_header), sizeof(output_header));
-    output.seekp(static_cast<std::streamoff>(ehdr->e_phoff));
-    output.write(reinterpret_cast<const char *>(info->dlpi_phdr),
-                 static_cast<std::streamsize>(ehdr->e_phnum * sizeof(ElfW(Phdr))));
     for (size_t i = 0; i < info->dlpi_phnum; ++i) {
         const auto &phdr = info->dlpi_phdr[i];
         if (phdr.p_type != PT_LOAD || phdr.p_filesz == 0) continue;
@@ -113,6 +108,13 @@ static int dump_loaded_library(struct dl_phdr_info *info, size_t, void *opaque) 
         output.write(reinterpret_cast<const char *>(base + phdr.p_vaddr),
                      static_cast<std::streamsize>(phdr.p_filesz));
     }
+    // PT_LOAD at offset zero contains the original in-memory ELF header, so
+    // write the sanitized headers after all segments have been copied.
+    output.seekp(0);
+    output.write(reinterpret_cast<const char *>(&output_header), sizeof(output_header));
+    output.seekp(static_cast<std::streamoff>(ehdr->e_phoff));
+    output.write(reinterpret_cast<const char *>(info->dlpi_phdr),
+                 static_cast<std::streamsize>(ehdr->e_phnum * sizeof(ElfW(Phdr))));
     context->found = output.good();
     return 1;
 }
